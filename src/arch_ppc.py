@@ -106,30 +106,26 @@ class FcmpoCrorPattern(SimpleAsmPattern):
         fcmpo = m.body[0]
         assert isinstance(fcmpo, Instruction)
         if m.literals["N"] == 0:
-            return Replacement([m.derived_instr("fcmpo.lte", fcmpo.args)], len(m.body))
+            return m.replace(m.derived_instr("fcmpo.lte", fcmpo.args))
         elif m.literals["N"] == 1:
-            return Replacement([m.derived_instr("fcmpo.gte", fcmpo.args)], len(m.body))
+            return m.replace(m.derived_instr("fcmpo.gte", fcmpo.args))
         return None
 
 
 class TailCallPattern(AsmPattern):
+    pattern = make_pattern("b")
+
     def match(self, matcher: AsmMatcher) -> Optional[Replacement]:
-        if matcher.index != len(matcher.input) - 1:
+        m = matcher.try_match(self.pattern)
+        if not m or len(matcher.remaining) != 1:
             return None
-        instr = matcher.input[matcher.index]
-        if (
-            isinstance(instr, Instruction)
-            and instr.mnemonic == "b"
-            and isinstance(instr.args[0], AsmGlobalSymbol)
-        ):
-            return Replacement(
-                [
-                    Instruction.derived("bl", instr.args, instr),
-                    Instruction.derived("blr", [], instr),
-                ],
-                1,
-            )
-        return None
+        b = m.body[0]
+        assert isinstance(b, Instruction)
+        if not isinstance(b.args[0], AsmGlobalSymbol):
+            return None
+        bl = m.derived_instr("bl", b.args)
+        blr = m.derived_instr("blr", [])
+        return m.replace(bl, blr)
 
 
 class DoubleNotPattern(SimpleAsmPattern):
@@ -139,10 +135,52 @@ class DoubleNotPattern(SimpleAsmPattern):
         "subfe $r0, $r0, $a",
     )
 
-    def replace(self, m: AsmMatch) -> Optional[Replacement]:
-        return Replacement(
-            [m.derived_instr("notnot.fictive", [Register("r0"), m.regs["x"]])],
-            len(m.body),
+    def replace(self, m: AsmMatch) -> Replacement:
+        return m.replace(
+            m.derived_instr("notnot.fictive", [Register("r0"), m.regs["x"]])
+        )
+
+
+class IntToFloatPattern(AsmPattern):
+    pattern1 = make_pattern(
+        "xoris $x, $i, 0x8000",
+        "stw $x, N($r1)",
+        "lis $y, 0x4330",
+        "stw $y, (N - 4)($r1)",
+        "lfd $z, (N - 4)($r1)",
+        "*SUB $o, $z, $w",  # fsub or fsubs
+    )
+    pattern2 = make_pattern(
+        "xoris $x, $i, 0x8000",
+        "lis $y, 0x4330",
+        "stw $x, N($r1)",
+        "stw $y, (N - 4)($r1)",
+        "lfd $z, (N - 4)($r1)",
+        "*SUB $o, $z, $w",  # fsub or fsubs
+    )
+
+    def match(self, matcher: AsmMatcher) -> Optional[Replacement]:
+        m = matcher.try_match(self.pattern1, True)
+        lisi = 2
+        if not m:
+            m = matcher.try_match(self.pattern2, True)
+            lisi = 1
+            if not m:
+                return None
+        sub = m.instructions["SUB"]
+        if sub.mnemonic == "fsubs":
+            mn = "cvt.s.w.fictive"
+        elif sub.mnemonic == "fsub":
+            mn = "cvt.d.w.fictive"
+        else:
+            return None
+        temp_reg = matcher.unique_reg()
+        return m.replace(
+            m.derived_instr("addi", [temp_reg, m.regs["i"], AsmLiteral(0)]),
+            m.body[0],
+            m.body[lisi],
+            *m.unrelated,
+            m.derived_instr(mn, [m.regs["o"], temp_reg]),
         )
 
 
@@ -433,6 +471,7 @@ class PpcArch(Arch):
         FcmpoCrorPattern(),
         TailCallPattern(),
         DoubleNotPattern(),
+        IntToFloatPattern(),
     ]
 
     instrs_ignore: InstrSet = {
@@ -652,7 +691,7 @@ class PpcArch(Arch):
         "frsp": lambda a: handle_convert(a.reg(1), Type.f32(), Type.f64()),
         # TODO: This yields some awkward-looking C code, often in the form:
         # `sp100 = (bitwise f64) (s32) x; y = sp104;` instead of `y = (s32) x;`.
-        # We should try to detect these idioms, along with int-to-float
+        # We should try to detect these idioms
         "fctiwz": lambda a: handle_convert(a.reg(1), Type.s32(), Type.floatish()),
         # PPC Floating Poing Fused Multiply-{Add,Sub}
         "fmadd": lambda a: BinaryOp.f64(
@@ -689,6 +728,9 @@ class PpcArch(Arch):
         ),
         # TODO: Detect if we should use fabs or fabsf
         "fabs": lambda a: fn_op("fabs", [a.reg(1)], Type.floatish()),
+        "cvt.s.w.fictive": lambda a: handle_convert(
+            a.reg(1), Type.f32(), Type.intish()
+        ),
     }
     instrs_load_update: InstrMap = {
         "lbau": lambda a: handle_load(a, type=Type.s8()),

@@ -1,6 +1,6 @@
 import abc
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, TypeVar, Union
+from typing import Dict, List, Optional, Sequence, Tuple, TypeVar, Union
 
 from .parse_file import Label
 from .parse_instruction import (
@@ -19,8 +19,7 @@ from .parse_instruction import (
 
 
 BodyPart = Union[Instruction, Label]
-PatternPart = Union[Instruction, Label, None]
-Pattern = List[Tuple[PatternPart, bool]]
+Pattern = List[Tuple[BodyPart, bool]]
 
 
 def make_pattern(*parts: str) -> Pattern:
@@ -28,9 +27,7 @@ def make_pattern(*parts: str) -> Pattern:
     for part in parts:
         optional = part.endswith("?")
         part = part.rstrip("?")
-        if part == "*":
-            ret.append((None, optional))
-        elif part.endswith(":"):
+        if part.endswith(":"):
             ret.append((Label(part.strip(".:")), optional))
         else:
             ins = parse_instruction(part, InstructionMeta.missing(), NaiveParsingArch())
@@ -40,19 +37,24 @@ def make_pattern(*parts: str) -> Pattern:
 
 @dataclass
 class Replacement:
-    new_body: List[BodyPart]
+    new_body: Sequence[BodyPart]
     num_consumed: int
 
 
 @dataclass
 class AsmMatch:
     body: List[BodyPart]
+    unrelated: List[Instruction]
     regs: Dict[str, Register]
     literals: Dict[str, int]
+    instructions: Dict[str, Instruction]
 
     def derived_instr(self, mnemonic: str, args: List[Argument]) -> Instruction:
         old_instr = next(part for part in self.body if isinstance(part, Instruction))
         return Instruction.derived(mnemonic, args, old_instr)
+
+    def replace(self, *new_body: BodyPart) -> Replacement:
+        return Replacement(new_body, len(self.body) + len(self.unrelated))
 
 
 class AsmPattern(abc.ABC):
@@ -83,8 +85,17 @@ class TryMatchState:
     symbolic_registers: Dict[str, Register] = field(default_factory=dict)
     symbolic_labels: Dict[str, str] = field(default_factory=dict)
     symbolic_literals: Dict[str, int] = field(default_factory=dict)
+    symbolic_instructions: Dict[str, Instruction] = field(default_factory=dict)
 
     T = TypeVar("T")
+
+    def copy(self) -> "TryMatchState":
+        return TryMatchState(
+            self.symbolic_registers.copy(),
+            self.symbolic_labels.copy(),
+            self.symbolic_literals.copy(),
+            self.symbolic_instructions.copy(),
+        )
 
     def match_var(self, var_map: Dict[str, T], key: str, value: T) -> bool:
         if key in var_map:
@@ -145,9 +156,7 @@ class TryMatchState:
             return isinstance(a, AsmLiteral) and a.value == self.eval_math(e)
         assert False, f"bad pattern part: {e}"
 
-    def match_one(self, actual: BodyPart, exp: PatternPart) -> bool:
-        if exp is None:
-            return True
+    def match_one(self, actual: BodyPart, exp: BodyPart) -> bool:
         if isinstance(exp, Label):
             return isinstance(actual, Label) and self.match_var(
                 self.symbolic_labels, exp.name, actual.name
@@ -155,7 +164,9 @@ class TryMatchState:
         if not isinstance(actual, Instruction):
             return False
         ins = actual
-        if ins.mnemonic != exp.mnemonic:
+        if exp.mnemonic.startswith("*"):
+            self.symbolic_instructions[exp.mnemonic[1:]] = ins
+        elif ins.mnemonic != exp.mnemonic:
             return False
         if exp.args:
             if len(ins.args) != len(exp.args):
@@ -168,28 +179,60 @@ class TryMatchState:
 
 @dataclass
 class AsmMatcher:
-    input: List[BodyPart]
+    remaining: List[BodyPart]
     output: List[BodyPart] = field(default_factory=list)
-    index: int = 0
+    unique_ctr: int = 0
 
-    def try_match(self, pattern: Pattern) -> Optional[AsmMatch]:
+    def try_match(
+        self, pattern: Pattern, allow_reorder: bool = False
+    ) -> Optional[AsmMatch]:
         state = TryMatchState()
 
-        start_index = index = self.index
-        for (pat, optional) in pattern:
-            if index < len(self.input) and state.match_one(self.input[index], pat):
-                index += 1
-            elif not optional:
-                return None
+        pati = 0
+        index = len(self.remaining) - 1
+        consumed = []
+        unrelated = []
+        while pati < len(pattern):
+            exp, optional = pattern[pati]
+            if index < 0:
+                if not optional:
+                    return None
+                break
+            saved_state = state.copy()
+            actual = self.remaining[index]
+            if state.match_one(actual, exp):
+                consumed.append(actual)
+                index -= 1
+                pati += 1
+            else:
+                state = saved_state
+                if optional:
+                    pati += 1
+                elif allow_reorder and consumed and not isinstance(actual, Label):
+                    unrelated.append(actual)
+                    index -= 1
+                else:
+                    return None
         return AsmMatch(
-            self.input[start_index:index],
+            consumed,
+            unrelated,
             state.symbolic_registers,
             state.symbolic_literals,
+            state.symbolic_instructions,
         )
 
+    def unique_reg(self) -> Register:
+        self.unique_ctr += 1
+        return Register(f"fakereg{self.unique_ctr}")
+
     def apply(self, repl: Replacement) -> None:
-        self.output.extend(repl.new_body)
-        self.index += repl.num_consumed
+        for _ in range(repl.num_consumed):
+            self.remaining.pop()
+        for part in repl.new_body[::-1]:
+            self.remaining.append(part)
+
+    def skip(self) -> None:
+        self.output.append(self.remaining.pop())
 
 
 def simplify_patterns(
@@ -198,14 +241,14 @@ def simplify_patterns(
     """Detect and simplify asm standard patterns emitted by known compilers. This is
     especially useful for patterns that involve branches, which are hard to deal with
     in the translate phase."""
-    matcher = AsmMatcher(body)
-    while matcher.index < len(matcher.input):
+    matcher = AsmMatcher(body[::-1])
+    while matcher.remaining:
         for pattern in patterns:
             m = pattern.match(matcher)
             if m:
                 matcher.apply(m)
                 break
         else:
-            matcher.apply(Replacement([matcher.input[matcher.index]], 1))
+            matcher.skip()
 
     return matcher.output

@@ -167,7 +167,7 @@ class DivPattern(SimpleAsmPattern):
     )
 
     def replace(self, m: AsmMatch) -> Replacement:
-        return Replacement([m.body[1]], len(m.body) - 1)
+        return m.replace(m.body[1], m.body[-1])
 
 
 class DivuPattern(SimpleAsmPattern):
@@ -179,7 +179,7 @@ class DivuPattern(SimpleAsmPattern):
     )
 
     def replace(self, m: AsmMatch) -> Replacement:
-        return Replacement([], len(m.body) - 1)
+        return m.replace(m.body[-1])
 
 
 class ModP2Pattern(SimpleAsmPattern):
@@ -197,7 +197,7 @@ class ModP2Pattern(SimpleAsmPattern):
         mod = m.derived_instr(
             "mod.fictive", [m.regs["o"], m.regs["i"], AsmLiteral(val)]
         )
-        return Replacement([mod], len(m.body) - 1)
+        return m.replace(mod, m.body[-1])
 
 
 class DivP2Pattern1(SimpleAsmPattern):
@@ -216,7 +216,7 @@ class DivP2Pattern1(SimpleAsmPattern):
         div = m.derived_instr(
             "div.fictive", [m.regs["o"], m.regs["i"], AsmLiteral(2 ** shift)]
         )
-        return Replacement([div], len(m.body) - 1)
+        return m.replace(div, m.body[-1])
 
 
 class DivP2Pattern2(SimpleAsmPattern):
@@ -235,7 +235,7 @@ class DivP2Pattern2(SimpleAsmPattern):
         div = m.derived_instr(
             "div.fictive", [m.regs["x"], m.regs["x"], AsmLiteral(2 ** shift)]
         )
-        return Replacement([div], len(m.body))
+        return m.replace(div)
 
 
 class Div2S16Pattern(SimpleAsmPattern):
@@ -250,7 +250,7 @@ class Div2S16Pattern(SimpleAsmPattern):
     def replace(self, m: AsmMatch) -> Replacement:
         # Keep 32->16 conversion from $i to $o, just add a division
         div = m.derived_instr("div.fictive", [m.regs["o"], m.regs["o"], AsmLiteral(2)])
-        return Replacement(m.body[:2] + [div], len(m.body))
+        return m.replace(m.body[0], m.body[1], div)
 
 
 class Div2S32Pattern(SimpleAsmPattern):
@@ -262,7 +262,7 @@ class Div2S32Pattern(SimpleAsmPattern):
 
     def replace(self, m: AsmMatch) -> Replacement:
         div = m.derived_instr("div.fictive", [m.regs["o"], m.regs["i"], AsmLiteral(2)])
-        return Replacement([div], len(m.body))
+        return m.replace(div)
 
 
 class UtfPattern(SimpleAsmPattern):
@@ -277,8 +277,8 @@ class UtfPattern(SimpleAsmPattern):
     )
 
     def replace(self, m: AsmMatch) -> Replacement:
-        new_instr = m.derived_instr("cvt.s.u.fictive", [m.regs["o"], m.regs["i"]])
-        return Replacement([new_instr], len(m.body) - 1)
+        cvt = m.derived_instr("cvt.s.u.fictive", [m.regs["o"], m.regs["i"]])
+        return m.replace(cvt, m.body[-1])
 
 
 class FtuPattern(SimpleAsmPattern):
@@ -293,10 +293,10 @@ class FtuPattern(SimpleAsmPattern):
         "mtc1",
         "mtc1?",
         "li",
-        "*",  # sub.fmt *, X, *
+        "*SUB $x, $i, $y",  # sub.s or sub.d
         "ctc1",
         "nop",
-        "*",  # cvt.w.fmt *, *
+        "*",  # cvt.w.s or cvt.w.d
         "cfc1",
         "nop",
         "andi",
@@ -310,26 +310,24 @@ class FtuPattern(SimpleAsmPattern):
         ".A:",
         "b",
         "li",
-        "*",  # label: (moved one step down if bneql)
-        "*",  # mfc1
+        ".L:?",  # moved one step down if bneql
+        "mfc1",
+        ".L:?",
         "nop",
         "bltz",
         "nop",
     )
 
-    def replace(self, m: AsmMatch) -> Replacement:
-        sub = next(
-            x
-            for x in m.body
-            if isinstance(x, Instruction) and x.mnemonic.startswith("sub")
-        )
-        fmt = sub.mnemonic.split(".")[-1]
-        args = [m.regs["o"], sub.args[1]]
-        if fmt == "s":
-            new_instr = m.derived_instr("cvt.u.s.fictive", args)
+    def replace(self, m: AsmMatch) -> Optional[Replacement]:
+        sub = m.instructions["SUB"]
+        if sub.mnemonic == "sub.s":
+            mn = "cvt.u.s.fictive"
+        elif sub.mnemonic == "sub.d":
+            mn = "cvt.u.d.fictive"
         else:
-            new_instr = m.derived_instr("cvt.u.d.fictive", args)
-        return Replacement([new_instr], len(m.body))
+            return None
+        new_instr = m.derived_instr(mn, [m.regs["o"], m.regs["i"]])
+        return m.replace(new_instr)
 
 
 class Mips1DoubleLoadStorePattern(AsmPattern):
@@ -366,7 +364,7 @@ class Mips1DoubleLoadStorePattern(AsmPattern):
         new_args = [ra, mb]
         new_mn = "ldc1" if a.mnemonic == "lwc1" else "sdc1"
         new_instr = m.derived_instr(new_mn, new_args)
-        return Replacement([new_instr], len(m.body))
+        return m.replace(new_instr)
 
 
 class GccSqrtPattern(SimpleAsmPattern):
@@ -382,7 +380,7 @@ class GccSqrtPattern(SimpleAsmPattern):
     )
 
     def replace(self, m: AsmMatch) -> Replacement:
-        return Replacement([m.body[0]], len(m.body))
+        return m.replace(m.body[0])
 
 
 class TrapuvPattern(SimpleAsmPattern):
@@ -400,7 +398,7 @@ class TrapuvPattern(SimpleAsmPattern):
 
     def replace(self, m: AsmMatch) -> Replacement:
         new_instr = m.derived_instr("trapuv.fictive", [])
-        return Replacement([m.body[2], new_instr], len(m.body))
+        return m.replace(m.body[2], new_instr)
 
 
 class MipsArch(Arch):
