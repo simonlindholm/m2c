@@ -231,7 +231,9 @@ class PersistentFunctionState:
     # Phi node inputs that can be inherited from the immediate dominator, despite
     # being clobbered on some path to there. Similar to planned_vars, this is
     # computed as part of `assign_naive_phis`.
-    planned_inherited_phis: Set[Tuple[Register, Node]] = field(default_factory=set)
+    planned_inherited_phis: Dict[Tuple[Register, Node], bool] = field(
+        default_factory=dict
+    )
 
 
 @dataclass
@@ -473,11 +475,13 @@ class StackInfo:
             self.persistent_state.planned_vars[(reg, source)] = ret
         return ret
 
-    def add_planned_inherited_phi(self, node: Node, reg: Register) -> None:
-        self.persistent_state.planned_inherited_phis.add((reg, node))
+    def add_planned_inherited_phi(
+        self, node: Node, reg: Register, from_dominator: bool
+    ) -> None:
+        self.persistent_state.planned_inherited_phis[(reg, node)] = from_dominator
 
-    def is_planned_inherited_phi(self, node: Node, reg: Register) -> bool:
-        return (reg, node) in self.persistent_state.planned_inherited_phis
+    def get_planned_inherited_phi(self, node: Node, reg: Register) -> Optional[bool]:
+        return self.persistent_state.planned_inherited_phis.get((reg, node))
 
     def is_stack_reg(self, reg: Register) -> bool:
         if reg == self.global_info.arch.stack_pointer_reg:
@@ -1703,7 +1707,7 @@ class EvalOnceExpr(Expression):
     var: Var
     type: Type
 
-    source: Reference
+    sources: List[Reference]
 
     # True for function calls/errors
     emit_exactly_once: bool
@@ -2445,6 +2449,8 @@ def is_trivial_expression(expr: Expression) -> bool:
     # NaivePhiExpr could be made trivial, but it's better to keep it symmetric
     # with PlannedPhiExpr to avoid different deduplication between passes,
     # since that can cause naive phis to end up in the final output.
+    if isinstance(expr, EvalOnceExpr):
+        assert not expr.trivial, "???"
     if isinstance(expr, (Literal, GlobalSymbol, SecondF64Half)):
         return True
     if isinstance(expr, AddressOf):
@@ -3009,13 +3015,18 @@ def assign_naive_phis(
             # special-case len(exprs) == 1 by skipping the deeper unwrapping and
             # -- if the dominator acts as one of the phi sources, which is true
             # most of the time -- marking the phi as directly inheritable from
-            # the dominator during the next translation pass.
+            # the dominator during the next translation pass. If the dominator
+            # is not involved we can also inherit the expression from an
+            # arbitrary predecessor, as long as it's trivial.
             phi_expr = exprs[0] if len(exprs) == 1 else first_uw
             phi.replacement_expr = as_type(phi_expr, phi.type, silent=True)
             for _ in range(phi.num_usages):
                 phi_expr.use()
-            if phi.uses_dominator and len(exprs) == 1:
-                stack_info.add_planned_inherited_phi(phi.node, phi.reg)
+            if len(exprs) == 1:
+                if phi.uses_dominator:
+                    stack_info.add_planned_inherited_phi(phi.node, phi.reg, True)
+                elif is_trivial_expression(exprs[0]):
+                    stack_info.add_planned_inherited_phi(phi.node, phi.reg, False)
         else:
             for expr, blocks in equivalent_blocks.items():
                 for block in blocks:
@@ -3213,7 +3224,7 @@ class NodeState:
             wrapped_expr=expr,
             var=var,
             type=expr.type,
-            source=source,
+            sources=[source],
             emit_exactly_once=emit_exactly_once,
             trivial=trivial,
             transparent=transparent,
@@ -3260,7 +3271,8 @@ class NodeState:
         self._prevent_later_uses(lambda e: e == sub_expr)
 
     def prevent_later_var_uses(self, vars: Set[Var]) -> None:
-        self._prevent_later_uses(lambda e: var_for_expr(e) in vars)
+        if vars:
+            self._prevent_later_uses(lambda e: var_for_expr(e) in vars)
 
     def prevent_later_function_calls(self) -> None:
         """Prevent later uses of registers that recursively contain a function call."""
@@ -3690,25 +3702,58 @@ def create_dominated_node_state(
         r for r in locs_clobbered_until_dominator(child) if isinstance(r, Register)
     )
     for reg in phi_regs:
-        if stack_info.is_planned_inherited_phi(child, reg):
-            # A previous translation pass has determined that despite register
-            # writes along the way to the dominator, using the dominator's
-            # value is fine (because all possible phi values are the same).
-            # Do reset the 'initial' meta bit though: the non-dominator sources
-            # are non-initial.
-            meta = new_regs.get_meta(reg)
-            if meta is not None:
-                new_regs.update_meta(reg, replace(meta, initial=False))
+        sources, uses_dominator = reg_sources(child, reg)
+
+        inherited_phi = stack_info.get_planned_inherited_phi(child, reg)
+        if inherited_phi is not None:
+            # TODO set is_read for all parent blocks
+            if inherited_phi:
+                # A previous translation pass has determined that despite register
+                # writes along the way to the dominator, using the dominator's
+                # value is fine (because all possible phi values are the same).
+                # Do reset the 'initial' meta bit though: the non-dominator sources
+                # are non-initial (making the value more likely to be a function
+                # argument).
+                meta = new_regs.get_meta(reg)
+                if meta is not None:
+                    new_regs.update_meta(reg, replace(meta, initial=False))
+                    continue
+            else:
+                # Same thing, except we are allowed to inherit the value from an
+                # arbitrary parent (and we are guaranteed that it is trivial).
+                for parent in child.parents:
+                    if parent.block.block_info and isinstance(
+                        get_block_info(parent)
+                        .final_register_states.contents[reg]
+                        .value,
+                        EvalOnceExpr,
+                    ):
+                        parent_regs = get_block_info(parent).final_register_states
+                        break
+                else:
+                    # TODO: this can happen (NaivePhi is possible)
+                    assert False, "at least one parent should be translated already"
+                value = parent_regs.contents[reg].value
+                assert isinstance(value, EvalOnceExpr)
+                assert value.trivial
+                expr2 = EvalOnceExpr(
+                    wrapped_expr=value.wrapped_expr,
+                    var=Var(stack_info, "unused", value.type),
+                    type=value.type,
+                    sources=sources,
+                    emit_exactly_once=False,
+                    trivial=True,
+                    transparent=True,
+                )
+                meta = RegMeta()
+                new_regs.global_set_with_meta(reg, expr2, meta)
                 continue
 
-        sources, uses_dominator = reg_sources(child, reg)
         if uses_dominator:
             dom_expr = parent_state.regs.get_raw(reg)
             if dom_expr is None:
                 sources = []
-            elif isinstance(dom_expr, EvalOnceExpr):
-                sources.append(dom_expr.source)
-            elif isinstance(dom_expr, (PlannedPhiExpr, NaivePhiExpr)):
+            elif isinstance(dom_expr, (EvalOnceExpr, PlannedPhiExpr, NaivePhiExpr)):
                 sources.extend(dom_expr.sources)
             else:
                 static_assert_unreachable(dom_expr)
@@ -3752,8 +3797,7 @@ def create_dominated_node_state(
     # and that var gets assigned to somewhere along a path to the dominator,
     # using that expression requires it to be made into a temp.
     clobbered_vars, has_fn_call = find_clobbers_until_dominator(stack_info, child)
-    if clobbered_vars:
-        child_state.prevent_later_var_uses(clobbered_vars)
+    child_state.prevent_later_var_uses(clobbered_vars)
 
     # Prevent function calls from being moved across basic blocks, except for
     # trivial return stubs.
@@ -3772,7 +3816,7 @@ def create_dominated_node_state(
 
 
 def translate_all_blocks(
-    state: NodeState,
+    initial_state: NodeState,
     used_naive_phis: List[NaivePhiExpr],
     return_blocks: List[BlockInfo],
     options: Options,
@@ -3787,22 +3831,34 @@ def translate_all_blocks(
     dominator.
     """
     # Do the traversal non-recursively, in order to get nicer stacks for profiling.
-    translate_stack = [state]
+    seen_nodes: Set[Node] = set()
+    translate_stack: List[Tuple[Optional[NodeState], List[Node]]] = [
+        (None, [initial_state.node])
+    ]
     while translate_stack:
-        state = translate_stack.pop()
+        parent_state, children = translate_stack[-1]
+        if not children:
+            translate_stack.pop()
+            continue
+
+        node = children.pop(0)
+        if parent_state is None:
+            state = initial_state
+        else:
+            if isinstance(node, TerminalNode):
+                continue
+            # TODO: For the sake of inheritance of trivial
+            if not any(n in seen_nodes for n in node.parents):
+                children.append(node)
+                continue
+            state = create_dominated_node_state(parent_state, node, used_naive_phis)
+
+        seen_nodes.add(node)
         block_info = translate_block(state, options)
-        node = state.node
         node.block.add_block_info(block_info)
         if isinstance(node, ReturnNode):
             return_blocks.append(block_info)
-        # Add children to the translation queue in reverse order, to get a normally
-        # ordered pre-order traversal. (Doesn't affect the result majorly but it's
-        # easier to think about.)
-        for child in reversed(state.node.immediately_dominates):
-            if not isinstance(child, TerminalNode):
-                translate_stack.append(
-                    create_dominated_node_state(state, child, used_naive_phis)
-                )
+        translate_stack.append((state, node.immediately_dominates[:]))
 
 
 def resolve_types_late(stack_info: StackInfo) -> None:
