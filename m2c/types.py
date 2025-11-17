@@ -675,6 +675,7 @@ class Type:
             funcspec=[],
             init=None,
             bitsize=None,
+            asmlabel=None,
         )
         set_decl_name(decl)
         ret = to_c(decl)
@@ -763,6 +764,7 @@ class Type:
                     funcspec=[],
                     init=None,
                     bitsize=None,
+                    asmlabel=None,
                 )
                 set_decl_name(decl)
                 params.append(decl)
