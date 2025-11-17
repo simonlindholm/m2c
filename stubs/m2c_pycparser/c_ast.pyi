@@ -315,11 +315,13 @@ class EmptyStatement(Node):
 
 class Enum(Node):
     name: Optional[str]
+    gcc_attributes: List[GccAttribute]
     values: "Optional[EnumeratorList]"
 
     def __init__(
         self,
         name: Optional[str],
+        gcc_attributes: List[GccAttribute],
         values: "Optional[EnumeratorList]",
         coord: Optional[Coord] = None,
     ): ...
@@ -396,6 +398,12 @@ class FuncDef(Node):
         body: Compound,
         coord: Optional[Coord] = None,
     ): ...
+
+class GccAttribute(Node):
+    name: str
+    args: Optional[List[Expression]]
+
+    def __init__(self, name: str, args: Optional[List[Expression]], coord=None): ...
 
 class Goto(Node):
     name: str
@@ -481,11 +489,13 @@ class Return(Node):
 
 class Struct(Node):
     name: Optional[str]
+    gcc_attributes: List[GccAttribute]
     decls: Optional[List[Union_[Decl, Pragma]]]
 
     def __init__(
         self,
         name: Optional[str],
+        gcc_attributes: List[GccAttribute],
         decls: Optional[List[Union_[Decl, Pragma]]],
         coord: Optional[Coord] = None,
     ): ...
@@ -582,11 +592,13 @@ class UnaryOp(Node):
 
 class Union(Node):
     name: Optional[str]
+    gcc_attributes: List[GccAttribute]
     decls: Optional[List[Union_[Decl, Pragma]]]
 
     def __init__(
         self,
         name: Optional[str],
+        gcc_attributes: List[GccAttribute],
         decls: Optional[List[Union_[Decl, Pragma]]],
         coord: Optional[Coord] = None,
     ): ...
